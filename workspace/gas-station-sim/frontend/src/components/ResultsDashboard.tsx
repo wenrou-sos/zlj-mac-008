@@ -34,7 +34,7 @@ export default function ResultsDashboard({ result, config, prevKpis }: Props) {
 
       <div className="two-col">
         <section className="card">
-          <h3>人力负荷 vs 在岗人力</h3>
+          <h3>人力：实际需求（无约束）vs 在岗上限</h3>
           <StaffChart result={result} config={config} />
         </section>
         <section className="card">

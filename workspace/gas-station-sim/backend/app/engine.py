@@ -80,6 +80,7 @@ class Engine:
             "total_waiting": [],
             "active_services": [],
             "staff_capacity": [],
+            "staff_demand": [],   # 人力不限、备用全开时的并发服务需求（不被现有编制封顶）
             "open_pumps": [],
         }
 
@@ -93,8 +94,10 @@ class Engine:
 
     # ---------- 到达生成 ----------
     def _schedule_arrivals(self):
+        """只生成仿真窗口 [0, horizon) 内的到达；超出时长的时段部分被截断。"""
         vid = 0
         for period in self.cfg.periods:
+            end = min(period.end, self.horizon)
             for fuel_id, rate in period.arrivals.items():
                 if rate <= 0 or fuel_id not in self.pools:
                     continue
@@ -102,7 +105,7 @@ class Engine:
                 lam = rate / 60.0  # 辆/分钟
                 while True:
                     t += self.rng.expovariate(lam)
-                    if t >= period.end:
+                    if t >= end:
                         break
                     vid += 1
                     self._push(t, ARRIVAL, Vehicle(vid=vid, fuel=fuel_id, arrival=t))
@@ -213,6 +216,27 @@ class Engine:
         return next((f.name for f in self.cfg.fuels if f.id == fid), fid)
 
     # ---------- 采样 ----------
+    def _demand_now(self) -> int:
+        """无约束人力需求：假设人力充足、备用枪全开时，此刻可同时开展的服务数。
+
+        将在场车辆（排队 + 服务中，按到达先后）贪心匹配到兼容油枪（含备用枪），
+        匹配上的数量即该时刻真实需要的并发服务数，不被现有员工编制封顶。
+        """
+        taken = {pid: False for pid in self.pumps}
+        present: list[Vehicle] = []
+        for pool in self.pools.values():
+            present.extend(pool)
+        present.extend(p.current for p in self.pumps.values() if p.current is not None)
+        present.sort(key=lambda v: v.arrival)
+        demand = 0
+        for v in present:
+            for pid, p in self.pumps.items():
+                if not taken[pid] and v.fuel in p.fuels:
+                    taken[pid] = True
+                    demand += 1
+                    break
+        return demand
+
     def _sample(self, now: float):
         s = self.series
         s["times"].append(round(now, 2))
@@ -223,6 +247,7 @@ class Engine:
         s["total_waiting"].append(total)
         s["active_services"].append(self.active_services)
         s["staff_capacity"].append(self.cfg.staff_count * self.capacity_per_staff)
+        s["staff_demand"].append(self._demand_now())
         s["open_pumps"].append(sum(1 for p in self.pumps.values() if p.is_open))
         if now + 1 <= self.horizon:
             self._push(now + 1, SAMPLE)
@@ -234,12 +259,18 @@ class Engine:
         self._push(0.0, POLICY)
         self._push(0.0, SAMPLE)
         for p in self.cfg.periods:
-            self._emit(p.start, "period", f"进入时段 {int(p.start)}–{int(p.end)} 分钟")
+            if p.start < self.horizon:
+                self._emit(p.start, "period",
+                           f"进入时段 {int(p.start)}–{int(min(p.end, self.horizon))} 分钟")
+        if any(p.end > self.horizon for p in self.cfg.periods):
+            self._emit(self.horizon, "info",
+                       f"车流时段表超出模拟时长，{self.horizon:.0f} 分钟后不再产生新到站车辆")
 
-        drain_until = self.horizon + 180  # 结束后继续消化存量队列
+        # 硬截断：仿真窗口 [0, horizon]，窗口外不生成到达、不处理任何事件，
+        # 保证图表时间轴与 KPI、利用率、调度建议对应同一窗口。
         while self.events_q:
             t, _, kind, payload = heapq.heappop(self.events_q)
-            if t > drain_until:
+            if t > self.horizon:
                 break
             if kind == ARRIVAL:
                 self.pools[payload.fuel].append(payload)
@@ -261,14 +292,17 @@ class Engine:
             elif kind == SAMPLE:
                 self._sample(t)
 
-        end_t = min(drain_until, max([self.horizon] + [v.end or 0 for v in self.vehicles]))
+        end_t = self.horizon
+        # 截止时刻仍在加油的：补记窗口内忙碌时长，车辆计入未服务
         for p in self.pumps.values():
+            if p.current is not None:
+                p.busy_time += end_t - p.current.start
+                p.current = None
             if p.is_open:
                 p.open_time += end_t - p.last_change
                 p.open_intervals.append([round(p.last_change, 2), round(end_t, 2)])
         for f_id, pool in self.pools.items():
             self.unserved[f_id] = len(pool)
-        # 截断时仍在加油中的车辆也视为未完成
         for v in self.vehicles:
             if v.start is not None and v.end is None:
                 self.unserved[v.fuel] += 1
@@ -287,13 +321,13 @@ class Engine:
             wait_by_fuel[f.id] = self._stats(ws)
             wait_by_fuel[f.id]["unserved"] = self.unserved.get(f.id, 0)
 
-        # 人力需求：15 分钟桶内最大并发服务数 -> 所需员工
+        # 人力需求：15 分钟桶内最大"无约束并发服务需求" -> 所需员工（不被现有编制封顶）
         n_buckets = int(self.horizon // BUCKET_MIN) + 1
         bucket_need = [0] * n_buckets
-        times, act = self.series["times"], self.series["active_services"]
-        for t, a in zip(times, act):
+        times, dem = self.series["times"], self.series["staff_demand"]
+        for t, d in zip(times, dem):
             b = min(int(t // BUCKET_MIN), n_buckets - 1)
-            bucket_need[b] = max(bucket_need[b], a)
+            bucket_need[b] = max(bucket_need[b], d)
         staff_buckets = [
             {
                 "start": b * BUCKET_MIN,
@@ -317,6 +351,7 @@ class Engine:
 
         max_q = max(self.series["total_waiting"] or [0])
         max_q_t = self.series["times"][self.series["total_waiting"].index(max_q)] if max_q else 0
+        act = self.series["active_services"]
         kpis = {
             "arrived": len(self.vehicles),
             "served": len(served),
@@ -328,6 +363,7 @@ class Engine:
             "max_queue_time": round(max_q_t, 1),
             "sla_pct": round(100 * sum(1 for w in waits if w <= cfg.policy.wait_target) / len(waits), 1) if waits else 100,
             "staff_util": round(sum(act) / max(1, len(act)) / max(1, cfg.staff_count * self.capacity_per_staff), 3),
+            "peak_staff_needed": max((b["required"] for b in staff_buckets), default=0),
         }
 
         return SimResult(
@@ -348,13 +384,13 @@ class Engine:
         cfg = self.cfg
         recs: list[str] = []
 
-        # 1) 人力缺口窗口
+        # 1) 人力缺口窗口（需求不再被现有编制封顶，缺口真实可见）
         gaps = [b for b in buckets if b["required"] > b["scheduled"]]
         if gaps:
-            windows = self._merge_windows([ (g["start"], g["end"]) for g in gaps ])
-            peak_need = max(g["required"] for g in gaps)
+            windows = self._merge_windows([(g["start"], g["end"]) for g in gaps])
             for s, e in windows:
-                recs.append(f"人力缺口：{int(s)}–{int(e)} 分钟窗口需要 {peak_need} 名员工"
+                need = max(g["required"] for g in gaps if g["start"] >= s and g["end"] <= e)
+                recs.append(f"人力缺口：{int(s)}–{int(e)} 分钟窗口需要 {need} 名员工"
                             f"（现有 {cfg.staff_count} 名），建议安排机动班顶岗")
         elif kpis["staff_util"] < 0.4:
             recs.append(f"员工利用率仅 {kpis['staff_util']*100:.0f}%，低峰时段可考虑减少 1 名在岗或安排交叉培训")

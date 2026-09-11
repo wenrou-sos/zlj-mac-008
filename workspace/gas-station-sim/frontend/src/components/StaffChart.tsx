@@ -5,12 +5,12 @@ import type { SimConfig, SimResult } from "../types";
 import { fmtClock } from "../types";
 
 export default function StaffChart({ result }: { result: SimResult; config: SimConfig }) {
-  const { times, active_services, staff_capacity, open_pumps } = result.series;
+  const { times, active_services, staff_capacity, staff_demand } = result.series;
   const data = times.map((t, i) => ({
     t,
-    服务中: active_services[i],
+    实际服务中: active_services[i],
+    需求无约束: staff_demand[i],
     人力上限: staff_capacity[i],
-    开启油枪: open_pumps[i],
   }));
 
   return (
@@ -24,9 +24,9 @@ export default function StaffChart({ result }: { result: SimResult; config: SimC
           contentStyle={{ background: "#141b2e", border: "1px solid #2a3550", borderRadius: 8 }}
         />
         <Legend />
-        <Area type="stepAfter" dataKey="服务中" stroke="#4ade80" fill="#4ade80" fillOpacity={0.35} isAnimationActive={false} />
+        <Area type="stepAfter" dataKey="实际服务中" stroke="#4ade80" fill="#4ade80" fillOpacity={0.35} isAnimationActive={false} />
+        <Line type="stepAfter" dataKey="需求无约束" stroke="#fbbf24" strokeWidth={2} dot={false} isAnimationActive={false} />
         <Line type="stepAfter" dataKey="人力上限" stroke="#f87171" strokeDasharray="6 4" dot={false} isAnimationActive={false} />
-        <Line type="stepAfter" dataKey="开启油枪" stroke="#94a3b8" strokeDasharray="2 4" dot={false} isAnimationActive={false} />
       </ComposedChart>
     </ResponsiveContainer>
   );

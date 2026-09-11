@@ -64,7 +64,8 @@ export default function KpiCards({ result, config, prevKpis }: Props) {
     {
       label: "员工利用率",
       value: `${Math.round(k.staff_util * 100)}%`,
-      sub: `${config.staff_count} 名在岗 · 1人照看${config.policy.staff_pump_coverage}枪`,
+      sub: `${config.staff_count} 名在岗 · 高峰需求 ${k.peak_staff_needed ?? "?"} 人`,
+      bad: (k.peak_staff_needed ?? 0) > config.staff_count,
     },
   ];
   return (

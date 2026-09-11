@@ -83,6 +83,7 @@ export interface Series {
   total_waiting: number[];
   active_services: number[];
   staff_capacity: number[];
+  staff_demand: number[]; // 人力不限、备用全开时的并发服务需求（不被现有编制封顶）
   open_pumps: number[];
 }
 
